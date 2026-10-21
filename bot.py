@@ -93,56 +93,86 @@ def parse_signal(text):
     text = text.upper().replace(",", ".")
     text = text.replace("GOLD", "XAUUSD")
 
-    # Ignore pure TP HIT messages for now
-    if "TP" in text and "HIT" in text and "BUY" not in text and "SELL" not in text:
+    # Ignore pure TP HIT messages
+    if "HIT" in text and "BUY" not in text and "SELL" not in text:
         return None
 
+    # Direction
     direction = None
     if re.search(r'\bBUY\b', text):
         direction = "BUY"
     elif re.search(r'\bSELL\b', text):
         direction = "SELL"
 
+    if not direction:
+        return None
+
+    # Order type
     order_type = "MARKET"
     if "LIMIT" in text:
         order_type = "LIMIT"
     elif "STOP" in text:
         order_type = "STOP"
 
+    # Symbol
     symbols = ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "BTCUSD", "ETHUSD"]
     symbol = None
     for s in symbols:
         if s in text:
             symbol = s
             break
+    if not symbol:
+        return None
 
+    # Entry - several possible patterns
     entry = None
+
+    # Pattern 1: GOLD SELL 4120  or  XAUUSD BUY 2650
+    entry_match = re.search(rf'{symbol}\s+{direction}\s+([\d.]+)', text)
+    if entry_match:
+        entry = entry_match.group(1)
+    else:
+        # Pattern 2: SELL 4120 or BUY @ 4120
+        entry_match = re.search(rf'{direction}\s*(?:AT|@)?\s*([\d.]+)', text)
+        if entry_match:
+            entry = entry_match.group(1)
+        else:
+            # Pattern 3: classic ENTRY / AT
+            entry_match = re.search(r'(?:ENTRY\s*POINT|ENTRY|AT|@|PRICE|NOW)[:\s]*([\d.]+)', text)
+            if entry_match:
+                entry = entry_match.group(1)
+
+    # Range support (e.g. 4120-4130 or 4120 / 4130)
     range_match = re.search(r'([\d.]+)\s*[-–/]{1,2}\s*([\d.]+)', text)
-    if range_match:
+    if range_match and not entry:
         low = float(range_match.group(1))
         high = float(range_match.group(2))
         if direction == "BUY":
             entry = str(min(low, high))
             order_type = "LIMIT"
-        elif direction == "SELL":
+        else:
             entry = str(max(low, high))
             order_type = "LIMIT"
-    else:
-        entry_match = re.search(r'(?:ENTRY\s*POINT|ENTRY|AT|@|PRICE|NOW)[:\s]*([\d.]+)', text)
-        if entry_match:
-            entry = entry_match.group(1)
 
+    # SL - handles SL:::::4137 and normal SL 4137
     sl = None
     sl_match = re.search(r'(?:SL|STOP\s*LOSS|S/L)[:\s]*([\d.]+)', text)
     if sl_match:
         sl = sl_match.group(1)
 
-    tps = re.findall(r'(?:TP\d*|TAKE\s*PROFIT|T/P)[:\s]*([\d.]+)', text)
+    # TPs - handles TP¹ 4117, TP2 4114, TP ⁸4090, etc.
+    tps = re.findall(r'(?:TP\s*[¹²³⁴⁵⁶⁷⁸⁹0-9]*|TAKE\s*PROFIT|T/P)[:\s]*([\d.]+)', text)
+
+    # Also catch cases like TP ⁸4090 (number stuck to the symbol)
+    if not tps:
+        tps = re.findall(r'TP\s*[¹²³⁴⁵⁶⁷⁸⁹0-9]*\s*([\d.]+)', text)
 
     if direction and symbol and sl and tps:
-        if order_type != "MARKET" and not entry:
-            return None
+        # If no clear entry and it's a market-style signal, treat as MARKET
+        if not entry:
+            order_type = "MARKET"
         return symbol, direction, order_type, entry, sl, tps
+
     return None
 
 # === Main ===
