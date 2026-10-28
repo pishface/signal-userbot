@@ -117,12 +117,15 @@ async def close_symbol(symbol):
 
 # === Parser ===
 def parse_signal(text):
+def parse_signal(text):
     text = text.upper().replace(",", ".")
     text = text.replace("GOLD", "XAUUSD")
 
+    # Ignore pure TP HIT messages
     if "HIT" in text and "BUY" not in text and "SELL" not in text:
         return None
 
+    # Direction
     direction = None
     if re.search(r'\bBUY\b', text):
         direction = "BUY"
@@ -131,12 +134,14 @@ def parse_signal(text):
     if not direction:
         return None
 
+    # Order type
     order_type = "MARKET"
     if "LIMIT" in text:
         order_type = "LIMIT"
     elif "STOP" in text:
         order_type = "STOP"
 
+    # Symbol
     symbols = ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "BTCUSD", "ETHUSD"]
     symbol = None
     for s in symbols:
@@ -146,34 +151,33 @@ def parse_signal(text):
     if not symbol:
         return None
 
+    # Entry - handles "GOLD SELL 4050" and similar
     entry = None
     entry_match = re.search(rf'{symbol}\s+{direction}\s+([\d.]+)', text)
+    if not entry_match:
+        entry_match = re.search(rf'{direction}\s+([\d.]+)', text)
     if entry_match:
         entry = entry_match.group(1)
-    else:
-        entry_match = re.search(rf'{direction}\s*(?:AT|@)?\s*([\d.]+)', text)
-        if entry_match:
-            entry = entry_match.group(1)
-        else:
-            entry_match = re.search(r'(?:ENTRY\s*POINT|ENTRY|AT|@|PRICE|NOW)[:\s]*([\d.]+)', text)
-            if entry_match:
-                entry = entry_match.group(1)
 
-    range_match = re.search(r'([\d.]+)\s*[-–/]{1,2}\s*([\d.]+)', text)
-    if range_match and not entry:
-        low = float(range_match.group(1))
-        high = float(range_match.group(2))
-        entry = str(min(low, high)) if direction == "BUY" else str(max(low, high))
-        order_type = "LIMIT"
+    # Range support
+    if not entry:
+        range_match = re.search(r'([\d.]+)\s*[-–/]{1,2}\s*([\d.]+)', text)
+        if range_match:
+            low = float(range_match.group(1))
+            high = float(range_match.group(2))
+            entry = str(min(low, high)) if direction == "BUY" else str(max(low, high))
+            order_type = "LIMIT"
 
+    # SL - handles SL:::::4067
     sl = None
     sl_match = re.search(r'(?:SL|STOP\s*LOSS|S/L)[:\s]*([\d.]+)', text)
     if sl_match:
         sl = sl_match.group(1)
 
-    tps = re.findall(r'(?:TP\s*[¹²³⁴⁵⁶⁷⁸⁹0-9]*|TAKE\s*PROFIT|T/P)[:\s]*([\d.]+)', text)
+    # TPs - handles TP¹ 4047, TP ⁸4020, etc.
+    tps = re.findall(r'TP\s*[¹²³⁴⁵⁶⁷⁸⁹0-9]*\s*([\d.]+)', text)
     if not tps:
-        tps = re.findall(r'TP\s*[¹²³⁴⁵⁶⁷⁸⁹0-9]*\s*([\d.]+)', text)
+        tps = re.findall(r'(?:TP\d*|TAKE\s*PROFIT|T/P)[:\s]*([\d.]+)', text)
 
     if direction and symbol and sl and tps:
         if not entry:
@@ -201,12 +205,13 @@ async def main():
         message_id = event.message.id
         text_upper = text.upper()
 
-        # ===== CLOSE via REPLY =====
+# ===== CLOSE via REPLY =====
         if event.message.is_reply:
             reply_to_id = event.message.reply_to_msg_id
-            close_keywords = ["CLOSE", "CLOSETHE", "CLOSE THE", "SCALPERS CLOSE", "CLOSE NOW", "CLOSE HALF"]
-            
-            if any(kw in text_upper for kw in close_keywords):
+            text_upper = text.upper()
+
+            # Much more flexible close detection
+            if "CLOSE" in text_upper:
                 print(f"\n=== CLOSE (reply) from: {group_name} ===")
                 print(text)
 
@@ -219,14 +224,15 @@ async def main():
                     log_signal(group_name, message_id, symbol, "CLOSE", "", "", [], status, result)
                 else:
                     print("⚠️ Reply detected but no matching original signal found in database")
+                    # Fallback - try closing XAUUSD
+                    success, result = await close_symbol("XAUUSD")
+                    print(f"Fallback: {'✅' if success else '❌'} {result}")
                 return
 
         # ===== Normal CLOSE (not a reply) =====
-        close_keywords = ["CLOSE", "CLOSETHE", "CLOSE THE", "SCALPERS CLOSE", "CLOSE NOW"]
-        if any(kw in text_upper for kw in close_keywords) and ("PIP" in text_upper or "TRADE" in text_upper or "HERE" in text_upper):
+        if "CLOSE" in text_upper and ("PIP" in text_upper or "TRADE" in text_upper or "HERE" in text_upper or "SCALPER" in text_upper):
             print(f"\n=== CLOSE signal from: {group_name} ===")
             print(text)
-            # Fallback: try to close XAUUSD (most common)
             success, result = await close_symbol("XAUUSD")
             print(f"{'✅' if success else '❌'} {result}")
             log_signal(group_name, message_id, "XAUUSD", "CLOSE", "", "", [], "CLOSED" if success else "CLOSE_FAILED", result)
