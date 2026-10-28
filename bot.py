@@ -54,7 +54,7 @@ def get_signal_by_message_id(message_id):
     c.execute("SELECT symbol, group_name FROM signals WHERE message_id = ? AND status = 'SUCCESS' ORDER BY id DESC LIMIT 1", (message_id,))
     row = c.fetchone()
     conn.close()
-    return row  # (symbol, group_name) or None
+    return row
 
 # === MetaAPI ===
 async def get_connection():
@@ -117,15 +117,12 @@ async def close_symbol(symbol):
 
 # === Parser ===
 def parse_signal(text):
-def parse_signal(text):
     text = text.upper().replace(",", ".")
     text = text.replace("GOLD", "XAUUSD")
 
-    # Ignore pure TP HIT messages
     if "HIT" in text and "BUY" not in text and "SELL" not in text:
         return None
 
-    # Direction
     direction = None
     if re.search(r'\bBUY\b', text):
         direction = "BUY"
@@ -134,14 +131,12 @@ def parse_signal(text):
     if not direction:
         return None
 
-    # Order type
     order_type = "MARKET"
     if "LIMIT" in text:
         order_type = "LIMIT"
     elif "STOP" in text:
         order_type = "STOP"
 
-    # Symbol
     symbols = ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "BTCUSD", "ETHUSD"]
     symbol = None
     for s in symbols:
@@ -151,7 +146,6 @@ def parse_signal(text):
     if not symbol:
         return None
 
-    # Entry - handles "GOLD SELL 4050" and similar
     entry = None
     entry_match = re.search(rf'{symbol}\s+{direction}\s+([\d.]+)', text)
     if not entry_match:
@@ -159,7 +153,6 @@ def parse_signal(text):
     if entry_match:
         entry = entry_match.group(1)
 
-    # Range support
     if not entry:
         range_match = re.search(r'([\d.]+)\s*[-–/]{1,2}\s*([\d.]+)', text)
         if range_match:
@@ -168,13 +161,11 @@ def parse_signal(text):
             entry = str(min(low, high)) if direction == "BUY" else str(max(low, high))
             order_type = "LIMIT"
 
-    # SL - handles SL:::::4067
     sl = None
     sl_match = re.search(r'(?:SL|STOP\s*LOSS|S/L)[:\s]*([\d.]+)', text)
     if sl_match:
         sl = sl_match.group(1)
 
-    # TPs - handles TP¹ 4047, TP ⁸4020, etc.
     tps = re.findall(r'TP\s*[¹²³⁴⁵⁶⁷⁸⁹0-9]*\s*([\d.]+)', text)
     if not tps:
         tps = re.findall(r'(?:TP\d*|TAKE\s*PROFIT|T/P)[:\s]*([\d.]+)', text)
@@ -205,12 +196,10 @@ async def main():
         message_id = event.message.id
         text_upper = text.upper()
 
-# ===== CLOSE via REPLY =====
+        # ===== CLOSE via REPLY =====
         if event.message.is_reply:
             reply_to_id = event.message.reply_to_msg_id
-            text_upper = text.upper()
 
-            # Much more flexible close detection
             if "CLOSE" in text_upper:
                 print(f"\n=== CLOSE (reply) from: {group_name} ===")
                 print(text)
@@ -224,7 +213,6 @@ async def main():
                     log_signal(group_name, message_id, symbol, "CLOSE", "", "", [], status, result)
                 else:
                     print("⚠️ Reply detected but no matching original signal found in database")
-                    # Fallback - try closing XAUUSD
                     success, result = await close_symbol("XAUUSD")
                     print(f"Fallback: {'✅' if success else '❌'} {result}")
                 return
