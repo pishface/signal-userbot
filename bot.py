@@ -27,10 +27,13 @@ def init_db():
         message_id INTEGER,
         symbol TEXT,
         direction TEXT,
-        entry TEXT,
-        sl TEXT,
+        entry REAL,
+        sl REAL,
+        tp1 REAL,
+        tp2 REAL,
         tps TEXT,
         status TEXT,
+        stage INTEGER DEFAULT 0,
         error_message TEXT,
         profit REAL
     )''')
@@ -38,13 +41,33 @@ def init_db():
     conn.close()
 
 def log_signal(group_name, message_id, symbol, direction, entry, sl, tps, status, error_message="", profit=0.0):
+    tp1 = float(tps[0]) if len(tps) > 0 else None
+    tp2 = float(tps[1]) if len(tps) > 1 else None
+    entry_val = float(entry) if entry else None
+    sl_val = float(sl) if sl else None
+
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
     c.execute('''INSERT INTO signals 
-        (timestamp, group_name, message_id, symbol, direction, entry, sl, tps, status, error_message, profit)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-        (datetime.utcnow().isoformat(), group_name, message_id, symbol, direction, 
-         entry or "", sl or "", ",".join(tps) if tps else "", status, error_message, profit))
+        (timestamp, group_name, message_id, symbol, direction, entry, sl, tp1, tp2, tps, status, stage, error_message, profit)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)''',
+        (datetime.utcnow().isoformat(), group_name, message_id, symbol, direction,
+         entry_val, sl_val, tp1, tp2, ",".join(tps) if tps else "", status, error_message, profit))
+    conn.commit()
+    conn.close()
+
+def get_active_trades():
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("SELECT id, symbol, direction, entry, sl, tp1, tp2, stage FROM signals WHERE status = 'SUCCESS' AND stage < 2")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def update_stage(trade_id, new_stage):
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute("UPDATE signals SET stage = ? WHERE id = ?", (new_stage, trade_id))
     conn.commit()
     conn.close()
 
@@ -106,7 +129,6 @@ async def close_symbol(symbol):
             if pos["symbol"].upper() == symbol.upper():
                 await connection.close_position(pos["id"])
                 closed.append(f"{pos['symbol']} {pos['type']} {pos['volume']}")
-        
         if closed:
             return True, "Closed: " + " | ".join(closed)
         return False, f"No open positions found for {symbol}"
@@ -114,6 +136,78 @@ async def close_symbol(symbol):
         return False, str(e)
     finally:
         await connection.close()
+
+async def modify_sl_for_trade(symbol, entry, new_sl, direction):
+    """Move SL only on positions that match symbol + entry"""
+    connection = await get_connection()
+    try:
+        positions = await connection.get_positions()
+        modified = 0
+        for pos in positions:
+            if pos["symbol"].upper() != symbol.upper():
+                continue
+            # Match by entry price (with small tolerance)
+            if abs(float(pos["openPrice"]) - float(entry)) < 1.0:
+                await connection.modify_position(pos["id"], stop_loss=float(new_sl))
+                modified += 1
+        return modified
+    except Exception as e:
+        print(f"Error modifying SL: {e}")
+        return 0
+    finally:
+        await connection.close()
+
+# === Staged SL Checker ===
+async def staged_sl_checker():
+    while True:
+        try:
+            trades = get_active_trades()
+            if not trades:
+                await asyncio.sleep(45)
+                continue
+
+            connection = await get_connection()
+            positions = await connection.get_positions()
+            await connection.close()
+
+            for trade in trades:
+                trade_id, symbol, direction, entry, orig_sl, tp1, tp2, stage = trade
+                if entry is None or tp1 is None:
+                    continue
+
+                # Find current price from matching positions
+                current_price = None
+                for pos in positions:
+                    if pos["symbol"].upper() == symbol.upper() and abs(float(pos["openPrice"]) - float(entry)) < 1.0:
+                        current_price = float(pos["currentPrice"]) if "currentPrice" in pos else float(pos.get("current_price", 0))
+                        break
+
+                if current_price is None:
+                    continue
+
+                # Stage 0 → 1 : TP1 hit → Move to Break Even + 5 pips
+                if stage == 0 and tp1:
+                    hit_tp1 = (direction == "BUY" and current_price >= tp1) or (direction == "SELL" and current_price <= tp1)
+                    if hit_tp1:
+                        be_sl = entry + 5 if direction == "BUY" else entry - 5
+                        modified = await modify_sl_for_trade(symbol, entry, be_sl, direction)
+                        if modified > 0:
+                            update_stage(trade_id, 1)
+                            print(f"✅ Stage 1: {symbol} hit TP1 → SL moved to Break Even ({be_sl})")
+
+                # Stage 1 → 2 : TP2 hit → Move SL to TP1
+                elif stage == 1 and tp2:
+                    hit_tp2 = (direction == "BUY" and current_price >= tp2) or (direction == "SELL" and current_price <= tp2)
+                    if hit_tp2:
+                        modified = await modify_sl_for_trade(symbol, entry, tp1, direction)
+                        if modified > 0:
+                            update_stage(trade_id, 2)
+                            print(f"✅ Stage 2: {symbol} hit TP2 → SL moved to TP1 ({tp1})")
+
+        except Exception as e:
+            print(f"Staged SL checker error: {e}")
+
+        await asyncio.sleep(45)
 
 # === Parser ===
 def parse_signal(text):
@@ -185,6 +279,10 @@ async def main():
     await client.start()
     print("Userbot is running and listening to groups...")
 
+    # Start the staged SL background checker
+    asyncio.create_task(staged_sl_checker())
+    print("Staged SL protector started.")
+
     @client.on(events.NewMessage(chats=None))
     async def handler(event):
         text = event.message.message
@@ -199,31 +297,29 @@ async def main():
         # ===== CLOSE via REPLY =====
         if event.message.is_reply:
             reply_to_id = event.message.reply_to_msg_id
-
             if "CLOSE" in text_upper:
                 print(f"\n=== CLOSE (reply) from: {group_name} ===")
                 print(text)
-
                 original = get_signal_by_message_id(reply_to_id)
                 if original:
                     symbol, orig_group = original
                     success, result = await close_symbol(symbol)
                     status = "CLOSED" if success else "CLOSE_FAILED"
                     print(f"{'✅' if success else '❌'} {result}")
-                    log_signal(group_name, message_id, symbol, "CLOSE", "", "", [], status, result)
+                    log_signal(group_name, message_id, symbol, "CLOSE", None, None, [], status, result)
                 else:
-                    print("⚠️ Reply detected but no matching original signal found in database")
+                    print("⚠️ No matching original signal found")
                     success, result = await close_symbol("XAUUSD")
                     print(f"Fallback: {'✅' if success else '❌'} {result}")
                 return
 
-        # ===== Normal CLOSE (not a reply) =====
+        # ===== Normal CLOSE =====
         if "CLOSE" in text_upper and ("PIP" in text_upper or "TRADE" in text_upper or "HERE" in text_upper or "SCALPER" in text_upper):
             print(f"\n=== CLOSE signal from: {group_name} ===")
             print(text)
             success, result = await close_symbol("XAUUSD")
             print(f"{'✅' if success else '❌'} {result}")
-            log_signal(group_name, message_id, "XAUUSD", "CLOSE", "", "", [], "CLOSED" if success else "CLOSE_FAILED", result)
+            log_signal(group_name, message_id, "XAUUSD", "CLOSE", None, None, [], "CLOSED" if success else "CLOSE_FAILED", result)
             return
 
         # ===== ENTRY SIGNAL =====
