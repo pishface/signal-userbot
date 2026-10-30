@@ -527,4 +527,95 @@ async def main():
     await ensure_baseline()
     log.info("Day-start equity: %s", day_start_equity)
 
-    tasks = [  # keep 
+    tasks = [  # keep references so they aren't garbage collected
+        asyncio.create_task(staged_sl_loop()),
+        asyncio.create_task(risk_loop()),
+        asyncio.create_task(daily_summary_loop()),
+    ]
+    log.info("Background loops started")
+
+    @tg.on(events.NewMessage())
+    async def handler(event):
+        text = event.message.message
+        if not text:
+            return
+
+        # Commands: Saved Messages of this account, or a DM from OWNER_ID
+        if event.chat_id == me_id or (OWNER_ID and event.is_private and event.sender_id == OWNER_ID):
+            await handle_command(event, text)
+            return
+
+        # Never trade from DMs or from your own messages
+        if event.out or event.is_private:
+            return
+        chat_id = str(event.chat_id)
+        if ALLOWED_CHATS and chat_id not in ALLOWED_CHATS:
+            return
+
+        chat = await event.get_chat()
+        group_name = getattr(chat, "title", "Unknown")
+        message_id = event.message.id
+        t = text.upper()
+
+        # ---------- CLOSE (works even while paused) ----------
+        if "CLOSE" in t:
+            if re.search(r"HALF|PARTIAL|\b\d+\s*%", t):
+                await notify(f"ℹ️ Partial close in {group_name} ignored – handle manually:\n{text[:200]}")
+                return
+            if event.message.is_reply:
+                sig_id = get_signal_id(chat_id, event.message.reply_to_msg_id)
+                if sig_id:
+                    try:
+                        p, o = await broker.close_signal(sig_id)
+                        await notify(f"✅ CLOSE #{sig_id} ({group_name}): {p} positions, {o} orders")
+                        if p or o:
+                            set_status(sig_id, "CLOSED")
+                    except Exception as e:
+                        await notify(f"❌ CLOSE #{sig_id} failed: {e}")
+                    return
+            if ALLOW_GENERIC_CLOSE and any(w in t for w in ["PIP", "TRADE", "HERE", "SCALPER", "NOW"]):
+                try:
+                    p, o = await broker.close_symbol("XAUUSD")
+                    await notify(f"✅ Generic CLOSE ({group_name}): {p} XAUUSD positions, {o} orders")
+                except Exception as e:
+                    await notify(f"❌ Generic CLOSE failed: {e}")
+                return
+
+        # ---------- ENTRY ----------
+        parsed = parse_signal(text)
+        if not parsed:
+            return
+        if get_signal_id(chat_id, message_id):
+            return  # duplicate
+
+        if PAUSED or KILL_SWITCH or risk_paused:
+            log.info("Signal skipped (paused) from %s", group_name)
+            return
+        if not await check_risk():
+            return
+
+        symbol, direction, order_type, entry, sl, tps = parsed
+        log.info("SIGNAL %s chat=%s: %s %s %s | entry=%s SL=%s TPs=%s",
+                 group_name, chat_id, direction, order_type, symbol, entry or "market", sl, tps)
+
+        sig_id = insert_signal(group_name, chat_id, message_id, symbol, direction, entry, sl, tps)
+        ok, errs = await broker.place(sig_id, symbol, direction, order_type, entry, sl, tps)
+
+        if ok and not errs:
+            set_status(sig_id, "SUCCESS")
+            await notify(f"✅ #{sig_id} {direction} {symbol} ({group_name})\n{' | '.join(ok)}")
+        elif ok:
+            set_status(sig_id, "PARTIAL", "; ".join(errs))
+            await notify(f"⚠️ #{sig_id} PARTIAL {direction} {symbol}\nOK: {' | '.join(ok)}\nFailed: {'; '.join(errs)}")
+        else:
+            set_status(sig_id, "FAILED", "; ".join(errs))
+            await notify(f"❌ #{sig_id} FAILED {direction} {symbol}: {'; '.join(errs)}")
+
+    await tg.run_until_disconnected()
+    for t_ in tasks:
+        t_.cancel()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+ 
