@@ -7,16 +7,19 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from metaapi_cloud_sdk import MetaApi
 
-# === Environment variables ===
+# ================== CONFIG ==================
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-PHONE = os.getenv("PHONE")
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
-
 METAAPI_TOKEN = os.getenv("API_KEY")
 ACCOUNT_ID = os.getenv("ACCOUNT_ID")
 
-# === Database ===
+LOT_SIZE = float(os.getenv("LOT_SIZE", "0.01"))          # per TP leg
+MAX_TPS = int(os.getenv("MAX_TPS", "5"))
+BE_BUFFER_PIPS = float(os.getenv("BE_BUFFER_PIPS", "5")) # real pips
+MAX_OPEN_SIGNALS = int(os.getenv("MAX_OPEN_SIGNALS", "6"))
+
+# ================== DATABASE ==================
 def init_db():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
@@ -34,182 +37,131 @@ def init_db():
         tps TEXT,
         status TEXT,
         stage INTEGER DEFAULT 0,
-        error_message TEXT,
-        profit REAL
+        error_message TEXT
     )''')
     conn.commit()
     conn.close()
 
-def log_signal(group_name, message_id, symbol, direction, entry, sl, tps, status, error_message="", profit=0.0):
-    tp1 = float(tps[0]) if len(tps) > 0 else None
+def log_signal(group_name, message_id, symbol, direction, entry, sl, tps, status, error=""):
+    tp1 = float(tps[0]) if tps else None
     tp2 = float(tps[1]) if len(tps) > 1 else None
-    entry_val = float(entry) if entry else None
-    sl_val = float(sl) if sl else None
-
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
     c.execute('''INSERT INTO signals 
-        (timestamp, group_name, message_id, symbol, direction, entry, sl, tp1, tp2, tps, status, stage, error_message, profit)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)''',
+        (timestamp, group_name, message_id, symbol, direction, entry, sl, tp1, tp2, tps, status, stage, error_message)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)''',
         (datetime.utcnow().isoformat(), group_name, message_id, symbol, direction,
-         entry_val, sl_val, tp1, tp2, ",".join(tps) if tps else "", status, error_message, profit))
+         float(entry) if entry else None, float(sl) if sl else None,
+         tp1, tp2, ",".join(tps) if tps else "", status, error))
     conn.commit()
     conn.close()
 
 def get_active_trades():
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
-    c.execute("SELECT id, symbol, direction, entry, sl, tp1, tp2, stage FROM signals WHERE status = 'SUCCESS' AND stage < 2")
+    c.execute("SELECT id, symbol, direction, entry, tp1, tp2, stage FROM signals WHERE status='SUCCESS' AND stage < 2")
     rows = c.fetchall()
     conn.close()
     return rows
 
-def update_stage(trade_id, new_stage):
+def update_stage(trade_id, stage):
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
-    c.execute("UPDATE signals SET stage = ? WHERE id = ?", (new_stage, trade_id))
+    c.execute("UPDATE signals SET stage=? WHERE id=?", (stage, trade_id))
     conn.commit()
     conn.close()
 
 def get_signal_by_message_id(message_id):
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
-    c.execute("SELECT symbol, group_name FROM signals WHERE message_id = ? AND status = 'SUCCESS' ORDER BY id DESC LIMIT 1", (message_id,))
+    c.execute("SELECT symbol FROM signals WHERE message_id=? AND status='SUCCESS' ORDER BY id DESC LIMIT 1", (message_id,))
     row = c.fetchone()
     conn.close()
-    return row
+    return row[0] if row else None
 
-# === MetaAPI ===
-async def get_connection():
-    api = MetaApi(METAAPI_TOKEN)
-    account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
-    if account.state != 'DEPLOYED':
-        await account.deploy()
-        await account.wait_connected()
-    connection = account.get_rpc_connection()
-    await connection.connect()
-    await connection.wait_synchronized()
-    return connection
+# ================== BROKER ==================
+class Broker:
+    def __init__(self):
+        self.api = None
+        self.account = None
+        self.connection = None
 
-async def place_trade(symbol, direction, order_type, entry, sl, tps, volume=0.01):
-    connection = await get_connection()
-    results = []
-    volume_per_tp = max(0.01, round(volume / max(len(tps), 1), 2))
+    async def connect(self):
+        if self.connection:
+            return self.connection
+        self.api = MetaApi(METAAPI_TOKEN)
+        self.account = await self.api.metatrader_account_api.get_account(ACCOUNT_ID)
+        if self.account.state != 'DEPLOYED':
+            await self.account.deploy()
+            await self.account.wait_connected()
+        self.connection = self.account.get_rpc_connection()
+        await self.connection.connect()
+        await self.connection.wait_synchronized()
+        return self.connection
 
-    try:
-        for i, tp in enumerate(tps):
-            current_volume = volume_per_tp if i < len(tps) - 1 else round(volume - volume_per_tp * (len(tps) - 1), 2)
-            options = {"stop_loss": float(sl), "take_profit": float(tp)}
+    async def place(self, symbol, direction, order_type, entry, sl, tps):
+        connection = await self.connect()
+        results = []
+        tps = tps[:MAX_TPS]
+        n = len(tps)
+        if n == 0:
+            return False, "No TPs"
 
-            if order_type == "MARKET":
-                if direction == "BUY":
-                    await connection.create_market_buy_order(symbol, current_volume, **options)
-                else:
-                    await connection.create_market_sell_order(symbol, current_volume, **options)
-            elif order_type == "LIMIT":
-                if direction == "BUY":
-                    await connection.create_limit_buy_order(symbol, current_volume, float(entry), **options)
-                else:
-                    await connection.create_limit_sell_order(symbol, current_volume, float(entry), **options)
+        base = round(LOT_SIZE, 2)
+        volumes = [base] * n
+        # fix floating point so total is clean
+        total = round(base * n, 2)
 
-            results.append(f"TP{i+1}:{tp}")
-
-        return True, " | ".join(results)
-    except Exception as e:
-        return False, str(e)
-    finally:
-        await connection.close()
-
-async def close_symbol(symbol):
-    connection = await get_connection()
-    try:
-        positions = await connection.get_positions()
-        closed = []
-        for pos in positions:
-            if pos["symbol"].upper() == symbol.upper():
-                await connection.close_position(pos["id"])
-                closed.append(f"{pos['symbol']} {pos['type']} {pos['volume']}")
-        if closed:
-            return True, "Closed: " + " | ".join(closed)
-        return False, f"No open positions found for {symbol}"
-    except Exception as e:
-        return False, str(e)
-    finally:
-        await connection.close()
-
-async def modify_sl_for_trade(symbol, entry, new_sl, direction):
-    """Move SL only on positions that match symbol + entry"""
-    connection = await get_connection()
-    try:
-        positions = await connection.get_positions()
-        modified = 0
-        for pos in positions:
-            if pos["symbol"].upper() != symbol.upper():
-                continue
-            # Match by entry price (with small tolerance)
-            if abs(float(pos["openPrice"]) - float(entry)) < 1.0:
-                await connection.modify_position(pos["id"], stop_loss=float(new_sl))
-                modified += 1
-        return modified
-    except Exception as e:
-        print(f"Error modifying SL: {e}")
-        return 0
-    finally:
-        await connection.close()
-
-# === Staged SL Checker ===
-async def staged_sl_checker():
-    while True:
         try:
-            trades = get_active_trades()
-            if not trades:
-                await asyncio.sleep(45)
-                continue
+            for i, tp in enumerate(tps):
+                vol = volumes[i]
+                opts = {"stop_loss": float(sl), "take_profit": float(tp)}
 
-            connection = await get_connection()
-            positions = await connection.get_positions()
-            await connection.close()
-
-            for trade in trades:
-                trade_id, symbol, direction, entry, orig_sl, tp1, tp2, stage = trade
-                if entry is None or tp1 is None:
-                    continue
-
-                # Find current price from matching positions
-                current_price = None
-                for pos in positions:
-                    if pos["symbol"].upper() == symbol.upper() and abs(float(pos["openPrice"]) - float(entry)) < 1.0:
-                        current_price = float(pos["currentPrice"]) if "currentPrice" in pos else float(pos.get("current_price", 0))
-                        break
-
-                if current_price is None:
-                    continue
-
-                # Stage 0 → 1 : TP1 hit → Move to Break Even + 5 pips
-                if stage == 0 and tp1:
-                    hit_tp1 = (direction == "BUY" and current_price >= tp1) or (direction == "SELL" and current_price <= tp1)
-                    if hit_tp1:
-                        be_sl = entry + 5 if direction == "BUY" else entry - 5
-                        modified = await modify_sl_for_trade(symbol, entry, be_sl, direction)
-                        if modified > 0:
-                            update_stage(trade_id, 1)
-                            print(f"✅ Stage 1: {symbol} hit TP1 → SL moved to Break Even ({be_sl})")
-
-                # Stage 1 → 2 : TP2 hit → Move SL to TP1
-                elif stage == 1 and tp2:
-                    hit_tp2 = (direction == "BUY" and current_price >= tp2) or (direction == "SELL" and current_price <= tp2)
-                    if hit_tp2:
-                        modified = await modify_sl_for_trade(symbol, entry, tp1, direction)
-                        if modified > 0:
-                            update_stage(trade_id, 2)
-                            print(f"✅ Stage 2: {symbol} hit TP2 → SL moved to TP1 ({tp1})")
-
+                if order_type == "MARKET":
+                    if direction == "BUY":
+                        await connection.create_market_buy_order(symbol, vol, **opts)
+                    else:
+                        await connection.create_market_sell_order(symbol, vol, **opts)
+                else:  # LIMIT
+                    if direction == "BUY":
+                        await connection.create_limit_buy_order(symbol, vol, float(entry), **opts)
+                    else:
+                        await connection.create_limit_sell_order(symbol, vol, float(entry), **opts)
+                results.append(f"TP{i+1}:{tp}")
+            return True, " | ".join(results)
         except Exception as e:
-            print(f"Staged SL checker error: {e}")
+            return False, str(e)
 
-        await asyncio.sleep(45)
+    async def close_symbol(self, symbol):
+        connection = await self.connect()
+        try:
+            positions = await connection.get_positions()
+            closed = []
+            for pos in positions:
+                if pos["symbol"].upper() == symbol.upper():
+                    await connection.close_position(pos["id"])
+                    closed.append(f"{pos['volume']}")
+            return (True, f"Closed {len(closed)} positions") if closed else (False, "No positions")
+        except Exception as e:
+            return False, str(e)
 
-# === Parser ===
+    async def modify_sl(self, symbol, entry, new_sl):
+        connection = await self.connect()
+        try:
+            positions = await connection.get_positions()
+            count = 0
+            for pos in positions:
+                if pos["symbol"].upper() == symbol.upper() and abs(float(pos["openPrice"]) - float(entry)) < 1.5:
+                    await connection.modify_position(pos["id"], stop_loss=float(new_sl))
+                    count += 1
+            return count
+        except Exception as e:
+            print("Modify SL error:", e)
+            return 0
+
+broker = Broker()
+
+# ================== PARSER ==================
 def parse_signal(text):
     text = text.upper().replace(",", ".")
     text = text.replace("GOLD", "XAUUSD")
@@ -225,58 +177,162 @@ def parse_signal(text):
     if not direction:
         return None
 
+    # Very important: do NOT treat "STOP LOSS" as order type
     order_type = "MARKET"
-    if "LIMIT" in text:
+    if re.search(r'\bLIMIT\b', text):
         order_type = "LIMIT"
-    elif "STOP" in text:
+    elif re.search(r'\bBUY STOP\b|\bSELL STOP\b', text):
         order_type = "STOP"
 
     symbols = ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "BTCUSD", "ETHUSD"]
-    symbol = None
-    for s in symbols:
-        if s in text:
-            symbol = s
-            break
+    symbol = next((s for s in symbols if s in text), None)
     if not symbol:
         return None
 
+    # Entry
     entry = None
-    entry_match = re.search(rf'{symbol}\s+{direction}\s+([\d.]+)', text)
-    if not entry_match:
-        entry_match = re.search(rf'{direction}\s+([\d.]+)', text)
-    if entry_match:
-        entry = entry_match.group(1)
+    m = re.search(rf'{symbol}\s+{direction}\s+([\d.]+)', text)
+    if not m:
+        m = re.search(rf'{direction}\s+([\d.]+)', text)
+    if m:
+        entry = m.group(1)
 
     if not entry:
-        range_match = re.search(r'([\d.]+)\s*[-–/]{1,2}\s*([\d.]+)', text)
-        if range_match:
-            low = float(range_match.group(1))
-            high = float(range_match.group(2))
-            entry = str(min(low, high)) if direction == "BUY" else str(max(low, high))
+        m = re.search(r'([\d.]+)\s*[-–/]{1,2}\s*([\d.]+)', text)
+        if m:
+            low, high = float(m.group(1)), float(m.group(2))
+            entry = str(min(low, high) if direction == "BUY" else max(low, high))
             order_type = "LIMIT"
 
+    # SL
     sl = None
-    sl_match = re.search(r'(?:SL|STOP\s*LOSS|S/L)[:\s]*([\d.]+)', text)
-    if sl_match:
-        sl = sl_match.group(1)
+    m = re.search(r'(?:SL|STOP\s*LOSS|S/L)[:\s]*([\d.]+)', text)
+    if m:
+        sl = m.group(1)
 
+    # TPs - handles TP¹, TP 1, TP1, etc.
     tps = re.findall(r'TP\s*[¹²³⁴⁵⁶⁷⁸⁹0-9]*\s*([\d.]+)', text)
     if not tps:
-        tps = re.findall(r'(?:TP\d*|TAKE\s*PROFIT|T/P)[:\s]*([\d.]+)', text)
+        tps = re.findall(r'(?:TP\d*|TAKE\s*PROFIT)[:\s]*([\d.]+)', text)
 
     if direction and symbol and sl and tps:
-        if not entry:
-            order_type = "MARKET"
-        return symbol, direction, order_type, entry, sl, tps
+        return symbol, direction, order_type, entry, sl, tps[:MAX_TPS]
     return None
 
-# === Main ===
+# ================== STAGED SL ==================
+async def staged_sl_loop():
+    while True:
+        try:
+            trades = get_active_trades()
+            if not trades:
+                await asyncio.sleep(30)
+                continue
+
+            connection = await broker.connect()
+            positions = await connection.get_positions()
+
+            for trade_id, symbol, direction, entry, tp1, tp2, stage in trades:
+                if not entry or not tp1:
+                    continue
+
+                current = None
+                for pos in positions:
+                    if pos["symbol"].upper() == symbol.upper() and abs(float(pos["openPrice"]) - float(entry)) < 1.5:
+                        current = float(pos.get("currentPrice") or pos.get("current_price", 0))
+                        break
+                if current is None:
+                    continue
+
+                # Stage 0 → 1
+                if stage == 0:
+                    hit = (direction == "BUY" and current >= tp1) or (direction == "SELL" and current <= tp1)
+                    if hit:
+                        be = entry + (BE_BUFFER_PIPS * 0.1) if direction == "BUY" else entry - (BE_BUFFER_PIPS * 0.1)
+                        # Note: for gold 1 pip ≈ 0.1
+                        modified = await broker.modify_sl(symbol, entry, be)
+                        if modified:
+                            update_stage(trade_id, 1)
+                            print(f"✅ Stage 1: {symbol} → SL to BE ({be})")
+
+                # Stage 1 → 2
+                elif stage == 1 and tp2:
+                    hit = (direction == "BUY" and current >= tp2) or (direction == "SELL" and current <= tp2)
+                    if hit:
+                        modified = await broker.modify_sl(symbol, entry, tp1)
+                        if modified:
+                            update_stage(trade_id, 2)
+                            print(f"✅ Stage 2: {symbol} → SL to TP1 ({tp1})")
+
+        except Exception as e:
+            print("Staged SL error:", e)
+
+        await asyncio.sleep(30)
+
+# ================== MAIN ==================
 async def main():
     init_db()
-    print("Database ready.")
+    print("Database ready")
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
+    print("Userbot running – listening to all groups...")
+
+    asyncio.create_task(staged_sl_loop())
+    print("Staged SL protector started")
+
+    @client.on(events.NewMessage(chats=None))
+    async def handler(event):
+        text = event.message.message
+        if not text:
+            return
+
+        chat = await event.get_chat()
+        group_name = getattr(chat, "title", "Unknown")
+        message_id = event.message.id
+        text_upper = text.upper()
+
+        # ---------- CLOSE ----------
+        is_close = "CLOSE" in text_upper and any(w in text_upper for w in ["PIP", "TRADE", "HERE", "SCALPER", "NOW", "HALF"])
+
+        if event.message.is_reply and "CLOSE" in text_upper:
+            print(f"\n=== CLOSE (reply) from {group_name} ===")
+            original_symbol = get_signal_by_message_id(event.message.reply_to_msg_id)
+            symbol = original_symbol or "XAUUSD"
+            success, result = await broker.close_symbol(symbol)
+            print(("✅" if success else "❌"), result)
+            log_signal(group_name, message_id, symbol, "CLOSE", None, None, [], "CLOSED" if success else "CLOSE_FAILED", result)
+            return
+
+        if is_close:
+            print(f"\n=== CLOSE from {group_name} ===")
+            success, result = await broker.close_symbol("XAUUSD")
+            print(("✅" if success else "❌"), result)
+            log_signal(group_name, message_id, "XAUUSD", "CLOSE", None, None, [], "CLOSED" if success else "CLOSE_FAILED", result)
+            return
+
+        # ---------- ENTRY ----------
+        parsed = parse_signal(text)
+        if not parsed:
+            return
+
+        symbol, direction, order_type, entry, sl, tps = parsed
+
+        print(f"\n=== SIGNAL from {group_name} ===")
+        print(f"{direction} {order_type} {symbol} | Entry: {entry or 'Market'} | SL: {sl} | TPs: {tps}")
+
+        success, result = await broker.place(symbol, direction, order_type, entry, sl, tps)
+
+        if success:
+            print("✅", result)
+            log_signal(group_name, message_id, symbol, direction, entry, sl, tps, "SUCCESS")
+        else:
+            print("❌", result)
+            log_signal(group_name, message_id, symbol, direction, entry, sl, tps, "FAILED", result)
+
+    await client.run_until_disconnected()
+
+if __name__ == "__main__":
+    asyncio.run(main())t.start()
     print("Userbot is running and listening to groups...")
 
     # Start the staged SL background checker
