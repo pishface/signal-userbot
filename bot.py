@@ -2,7 +2,7 @@ import os
 import re
 import sqlite3
 import asyncio
-from datetime import datetime
+from datetime import datetime, date
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from metaapi_cloud_sdk import MetaApi
@@ -14,10 +14,15 @@ SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 METAAPI_TOKEN = os.getenv("API_KEY")
 ACCOUNT_ID = os.getenv("ACCOUNT_ID")
 
-LOT_SIZE = float(os.getenv("LOT_SIZE", "0.01"))          # per TP leg
-MAX_TPS = int(os.getenv("MAX_TPS", "5"))
-BE_BUFFER_PIPS = float(os.getenv("BE_BUFFER_PIPS", "5")) # real pips
-MAX_OPEN_SIGNALS = int(os.getenv("MAX_OPEN_SIGNALS", "6"))
+LOT_SIZE = float(os.getenv("LOT_SIZE", "0.01"))
+BE_BUFFER_PIPS = float(os.getenv("BE_BUFFER_PIPS", "5"))
+MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "5"))  # stop new trades
+KILL_SWITCH_PERCENT = float(os.getenv("KILL_SWITCH_PERCENT", "10"))       # close all + pause
+
+# ================== STATE ==================
+PAUSED = False
+KILL_SWITCH = False
+day_start_balance = None
 
 # ================== DATABASE ==================
 def init_db():
@@ -37,22 +42,28 @@ def init_db():
         tps TEXT,
         status TEXT,
         stage INTEGER DEFAULT 0,
-        error_message TEXT
+        error_message TEXT,
+        profit REAL DEFAULT 0
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS daily (
+        day TEXT PRIMARY KEY,
+        start_balance REAL,
+        end_balance REAL
     )''')
     conn.commit()
     conn.close()
 
-def log_signal(group_name, message_id, symbol, direction, entry, sl, tps, status, error=""):
+def log_signal(group_name, message_id, symbol, direction, entry, sl, tps, status, error="", profit=0.0):
     tp1 = float(tps[0]) if tps else None
     tp2 = float(tps[1]) if len(tps) > 1 else None
     conn = sqlite3.connect("trades.db")
     c = conn.cursor()
     c.execute('''INSERT INTO signals 
-        (timestamp, group_name, message_id, symbol, direction, entry, sl, tp1, tp2, tps, status, stage, error_message)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)''',
+        (timestamp, group_name, message_id, symbol, direction, entry, sl, tp1, tp2, tps, status, stage, error_message, profit)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)''',
         (datetime.utcnow().isoformat(), group_name, message_id, symbol, direction,
          float(entry) if entry else None, float(sl) if sl else None,
-         tp1, tp2, ",".join(tps) if tps else "", status, error))
+         tp1, tp2, ",".join(tps) if tps else "", status, error, profit))
     conn.commit()
     conn.close()
 
@@ -79,6 +90,20 @@ def get_signal_by_message_id(message_id):
     conn.close()
     return row[0] if row else None
 
+def get_group_stats():
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+    c.execute('''SELECT group_name, 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status='SUCCESS' THEN 1 ELSE 0 END) as success,
+                        SUM(profit) as total_profit
+                 FROM signals 
+                 WHERE status IN ('SUCCESS', 'CLOSED', 'FAILED')
+                 GROUP BY group_name''')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 # ================== BROKER ==================
 class Broker:
     def __init__(self):
@@ -99,30 +124,29 @@ class Broker:
         await self.connection.wait_synchronized()
         return self.connection
 
+    async def get_balance(self):
+        connection = await self.connect()
+        account_info = await connection.get_account_information()
+        return float(account_info.get("balance", 0))
+
     async def place(self, symbol, direction, order_type, entry, sl, tps):
         connection = await self.connect()
         results = []
-        tps = tps[:MAX_TPS]
         n = len(tps)
         if n == 0:
             return False, "No TPs"
 
-        base = round(LOT_SIZE, 2)
-        volumes = [base] * n
-        # fix floating point so total is clean
-        total = round(base * n, 2)
+        vol = round(LOT_SIZE, 2)
 
         try:
             for i, tp in enumerate(tps):
-                vol = volumes[i]
                 opts = {"stop_loss": float(sl), "take_profit": float(tp)}
-
                 if order_type == "MARKET":
                     if direction == "BUY":
                         await connection.create_market_buy_order(symbol, vol, **opts)
                     else:
                         await connection.create_market_sell_order(symbol, vol, **opts)
-                else:  # LIMIT
+                else:
                     if direction == "BUY":
                         await connection.create_limit_buy_order(symbol, vol, float(entry), **opts)
                     else:
@@ -136,12 +160,22 @@ class Broker:
         connection = await self.connect()
         try:
             positions = await connection.get_positions()
-            closed = []
+            closed = 0
             for pos in positions:
                 if pos["symbol"].upper() == symbol.upper():
                     await connection.close_position(pos["id"])
-                    closed.append(f"{pos['volume']}")
-            return (True, f"Closed {len(closed)} positions") if closed else (False, "No positions")
+                    closed += 1
+            return (True, f"Closed {closed} positions") if closed else (False, "No positions")
+        except Exception as e:
+            return False, str(e)
+
+    async def close_all(self):
+        connection = await self.connect()
+        try:
+            positions = await connection.get_positions()
+            for pos in positions:
+                await connection.close_position(pos["id"])
+            return True, f"Closed {len(positions)} positions"
         except Exception as e:
             return False, str(e)
 
@@ -177,7 +211,6 @@ def parse_signal(text):
     if not direction:
         return None
 
-    # Very important: do NOT treat "STOP LOSS" as order type
     order_type = "MARKET"
     if re.search(r'\bLIMIT\b', text):
         order_type = "LIMIT"
@@ -189,7 +222,6 @@ def parse_signal(text):
     if not symbol:
         return None
 
-    # Entry
     entry = None
     m = re.search(rf'{symbol}\s+{direction}\s+([\d.]+)', text)
     if not m:
@@ -204,80 +236,209 @@ def parse_signal(text):
             entry = str(min(low, high) if direction == "BUY" else max(low, high))
             order_type = "LIMIT"
 
-    # SL
     sl = None
     m = re.search(r'(?:SL|STOP\s*LOSS|S/L)[:\s]*([\d.]+)', text)
     if m:
         sl = m.group(1)
 
-    # TPs - handles TP¹, TP 1, TP1, etc.
     tps = re.findall(r'TP\s*[¹²³⁴⁵⁶⁷⁸⁹0-9]*\s*([\d.]+)', text)
     if not tps:
         tps = re.findall(r'(?:TP\d*|TAKE\s*PROFIT)[:\s]*([\d.]+)', text)
 
     if direction and symbol and sl and tps:
-        return symbol, direction, order_type, entry, sl, tps[:MAX_TPS]
+        return symbol, direction, order_type, entry, sl, tps
     return None
+
+# ================== RISK CHECK ==================
+async def check_risk():
+    global PAUSED, KILL_SWITCH, day_start_balance
+
+    try:
+        balance = await broker.get_balance()
+
+        if day_start_balance is None:
+            day_start_balance = balance
+            return True
+
+        loss_percent = ((day_start_balance - balance) / day_start_balance) * 100
+
+        if loss_percent >= KILL_SWITCH_PERCENT:
+            KILL_SWITCH = True
+            PAUSED = True
+            await broker.close_all()
+            print(f"KILL SWITCH triggered – down {loss_percent:.2f}%")
+            return False
+
+        if loss_percent >= MAX_DAILY_LOSS_PERCENT:
+            PAUSED = True
+            print(f"Daily loss limit reached – down {loss_percent:.2f}%")
+            return False
+
+        return True
+    except Exception as e:
+        print("Risk check error:", e)
+        return True
 
 # ================== STAGED SL ==================
 async def staged_sl_loop():
     while True:
         try:
             trades = get_active_trades()
-            if not trades:
-                await asyncio.sleep(30)
-                continue
+            if trades:
+                connection = await broker.connect()
+                positions = await connection.get_positions()
 
-            connection = await broker.connect()
-            positions = await connection.get_positions()
+                for trade_id, symbol, direction, entry, tp1, tp2, stage in trades:
+                    if not entry or not tp1:
+                        continue
 
-            for trade_id, symbol, direction, entry, tp1, tp2, stage in trades:
-                if not entry or not tp1:
-                    continue
+                    current = None
+                    for pos in positions:
+                        if pos["symbol"].upper() == symbol.upper() and abs(float(pos["openPrice"]) - float(entry)) < 1.5:
+                            current = float(pos.get("currentPrice") or pos.get("current_price", 0))
+                            break
+                    if current is None:
+                        continue
 
-                current = None
-                for pos in positions:
-                    if pos["symbol"].upper() == symbol.upper() and abs(float(pos["openPrice"]) - float(entry)) < 1.5:
-                        current = float(pos.get("currentPrice") or pos.get("current_price", 0))
-                        break
-                if current is None:
-                    continue
+                    if stage == 0:
+                        hit = (direction == "BUY" and current >= tp1) or (direction == "SELL" and current <= tp1)
+                        if hit:
+                            be = entry + (BE_BUFFER_PIPS * 0.1) if direction == "BUY" else entry - (BE_BUFFER_PIPS * 0.1)
+                            if await broker.modify_sl(symbol, entry, be):
+                                update_stage(trade_id, 1)
+                                print(f"✅ Stage 1: {symbol} → SL to BE ({be})")
 
-                # Stage 0 → 1
-                if stage == 0:
-                    hit = (direction == "BUY" and current >= tp1) or (direction == "SELL" and current <= tp1)
-                    if hit:
-                        be = entry + (BE_BUFFER_PIPS * 0.1) if direction == "BUY" else entry - (BE_BUFFER_PIPS * 0.1)
-                        # Note: for gold 1 pip ≈ 0.1
-                        modified = await broker.modify_sl(symbol, entry, be)
-                        if modified:
-                            update_stage(trade_id, 1)
-                            print(f"✅ Stage 1: {symbol} → SL to BE ({be})")
-
-                # Stage 1 → 2
-                elif stage == 1 and tp2:
-                    hit = (direction == "BUY" and current >= tp2) or (direction == "SELL" and current <= tp2)
-                    if hit:
-                        modified = await broker.modify_sl(symbol, entry, tp1)
-                        if modified:
-                            update_stage(trade_id, 2)
-                            print(f"✅ Stage 2: {symbol} → SL to TP1 ({tp1})")
-
+                    elif stage == 1 and tp2:
+                        hit = (direction == "BUY" and current >= tp2) or (direction == "SELL" and current <= tp2)
+                        if hit:
+                            if await broker.modify_sl(symbol, entry, tp1):
+                                update_stage(trade_id, 2)
+                                print(f"✅ Stage 2: {symbol} → SL to TP1 ({tp1})")
         except Exception as e:
             print("Staged SL error:", e)
 
         await asyncio.sleep(30)
 
-# ================== MAIN ==================
-PAUSED = False
+# ================== DAILY SUMMARY ==================
+async def daily_summary_loop(client):
+    while True:
+        now = datetime.utcnow()
+        # Run around 21:00 UTC
+        if now.hour == 21 and now.minute < 2:
+            try:
+                stats = get_group_stats()
+                balance = await broker.get_balance()
+                msg = f"📊 Daily Summary\nBalance: {balance:.2f}\n\n"
+                for group, total, success, profit in stats:
+                    msg += f"{group}: {success}/{total} | Profit: {profit or 0:.2f}\n"
+                await client.send_message("me", msg)
+            except Exception as e:
+                print("Daily summary error:", e)
+            await asyncio.sleep(120)
+        await asyncio.sleep(30)
 
+# ================== MAIN ==================
 async def main():
-    global PAUSED
+    global PAUSED, KILL_SWITCH, day_start_balance
     init_db()
     print("Database ready")
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
+    print("Userbot running – listening to all groups...")
+
+    day_start_balance = await broker.get_balance()
+    print(f"Starting balance today: {day_start_balance}")
+
+    asyncio.create_task(staged_sl_loop())
+    asyncio.create_task(daily_summary_loop(client))
+    print("Staged SL + Daily summary started")
+
+    @client.on(events.NewMessage(chats=None))
+    async def handler(event):
+        global PAUSED, KILL_SWITCH
+        text = event.message.message
+        if not text:
+            return
+
+        # ===== Commands =====
+        if event.is_private:
+            cmd = text.strip().lower()
+            if cmd == "/pause":
+                PAUSED = True
+                await event.reply("⏸ Bot paused")
+                return
+            elif cmd == "/resume":
+                PAUSED = False
+                KILL_SWITCH = False
+                await event.reply("▶️ Bot resumed + kill switch cleared")
+                return
+            elif cmd == "/status":
+                status = "KILL SWITCH" if KILL_SWITCH else ("PAUSED" if PAUSED else "RUNNING")
+                bal = await broker.get_balance()
+                await event.reply(f"Status: {status}\nBalance: {bal:.2f}")
+                return
+            elif cmd == "/stats":
+                stats = get_group_stats()
+                msg = "📈 Group Stats:\n\n"
+                for group, total, success, profit in stats:
+                    msg += f"{group}\n  Trades: {success}/{total}\n  Profit: {profit or 0:.2f}\n\n"
+                await event.reply(msg)
+                return
+
+        if PAUSED or KILL_SWITCH:
+            return
+
+        # Risk check before placing new trades
+        if not await check_risk():
+            return
+
+        chat = await event.get_chat()
+        group_name = getattr(chat, "title", "Unknown")
+        message_id = event.message.id
+        text_upper = text.upper()
+
+        # ---------- CLOSE ----------
+        is_close = "CLOSE" in text_upper and any(w in text_upper for w in ["PIP", "TRADE", "HERE", "SCALPER", "NOW", "HALF"])
+
+        if event.message.is_reply and "CLOSE" in text_upper:
+            print(f"\n=== CLOSE (reply) from {group_name} ===")
+            symbol = get_signal_by_message_id(event.message.reply_to_msg_id) or "XAUUSD"
+            success, result = await broker.close_symbol(symbol)
+            print(("✅" if success else "❌"), result)
+            log_signal(group_name, message_id, symbol, "CLOSE", None, None, [], "CLOSED" if success else "CLOSE_FAILED", result)
+            return
+
+        if is_close:
+            print(f"\n=== CLOSE from {group_name} ===")
+            success, result = await broker.close_symbol("XAUUSD")
+            print(("✅" if success else "❌"), result)
+            log_signal(group_name, message_id, "XAUUSD", "CLOSE", None, None, [], "CLOSED" if success else "CLOSE_FAILED", result)
+            return
+
+        # ---------- ENTRY ----------
+        parsed = parse_signal(text)
+        if not parsed:
+            return
+
+        symbol, direction, order_type, entry, sl, tps = parsed
+
+        print(f"\n=== SIGNAL from {group_name} ===")
+        print(f"{direction} {order_type} {symbol} | Entry: {entry or 'Market'} | SL: {sl} | TPs: {tps}")
+
+        success, result = await broker.place(symbol, direction, order_type, entry, sl, tps)
+
+        if success:
+            print("✅", result)
+            log_signal(group_name, message_id, symbol, direction, entry, sl, tps, "SUCCESS")
+        else:
+            print("❌", result)
+            log_signal(group_name, message_id, symbol, direction, entry, sl, tps, "FAILED", result)
+
+    await client.run_until_disconnected()
+
+if __name__ == "__main__":
+    asyncio.run(main())nt.start()
     print("Userbot running – listening to all groups...")
 
     asyncio.create_task(staged_sl_loop())
