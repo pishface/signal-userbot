@@ -269,7 +269,10 @@ async def staged_sl_loop():
         await asyncio.sleep(30)
 
 # ================== MAIN ==================
+PAUSED = False
+
 async def main():
+    global PAUSED
     init_db()
     print("Database ready")
 
@@ -282,8 +285,28 @@ async def main():
 
     @client.on(events.NewMessage(chats=None))
     async def handler(event):
+        global PAUSED
         text = event.message.message
         if not text:
+            return
+
+        # ===== Commands (only from Saved Messages / yourself) =====
+        if event.is_private:
+            cmd = text.strip().lower()
+            if cmd == "/pause":
+                PAUSED = True
+                await event.reply("⏸ Bot paused – no new trades will be opened")
+                return
+            elif cmd == "/resume":
+                PAUSED = False
+                await event.reply("▶️ Bot resumed")
+                return
+            elif cmd == "/status":
+                status = "⏸ PAUSED" if PAUSED else "▶️ RUNNING"
+                await event.reply(f"Bot status: {status}")
+                return
+
+        if PAUSED:
             return
 
         chat = await event.get_chat()
@@ -328,74 +351,6 @@ async def main():
         else:
             print("❌", result)
             log_signal(group_name, message_id, symbol, direction, entry, sl, tps, "FAILED", result)
-
-    await client.run_until_disconnected()
-
-if __name__ == "__main__":
-    asyncio.run(main())t.start()
-    print("Userbot is running and listening to groups...")
-
-    # Start the staged SL background checker
-    asyncio.create_task(staged_sl_checker())
-    print("Staged SL protector started.")
-
-    @client.on(events.NewMessage(chats=None))
-    async def handler(event):
-        text = event.message.message
-        if not text:
-            return
-
-        chat = await event.get_chat()
-        group_name = getattr(chat, "title", "Unknown")
-        message_id = event.message.id
-        text_upper = text.upper()
-
-        # ===== CLOSE via REPLY =====
-        if event.message.is_reply:
-            reply_to_id = event.message.reply_to_msg_id
-            if "CLOSE" in text_upper:
-                print(f"\n=== CLOSE (reply) from: {group_name} ===")
-                print(text)
-                original = get_signal_by_message_id(reply_to_id)
-                if original:
-                    symbol, orig_group = original
-                    success, result = await close_symbol(symbol)
-                    status = "CLOSED" if success else "CLOSE_FAILED"
-                    print(f"{'✅' if success else '❌'} {result}")
-                    log_signal(group_name, message_id, symbol, "CLOSE", None, None, [], status, result)
-                else:
-                    print("⚠️ No matching original signal found")
-                    success, result = await close_symbol("XAUUSD")
-                    print(f"Fallback: {'✅' if success else '❌'} {result}")
-                return
-
-        # ===== Normal CLOSE =====
-        if "CLOSE" in text_upper and ("PIP" in text_upper or "TRADE" in text_upper or "HERE" in text_upper or "SCALPER" in text_upper):
-            print(f"\n=== CLOSE signal from: {group_name} ===")
-            print(text)
-            success, result = await close_symbol("XAUUSD")
-            print(f"{'✅' if success else '❌'} {result}")
-            log_signal(group_name, message_id, "XAUUSD", "CLOSE", None, None, [], "CLOSED" if success else "CLOSE_FAILED", result)
-            return
-
-        # ===== ENTRY SIGNAL =====
-        parsed = parse_signal(text)
-        if not parsed:
-            return
-
-        symbol, direction, order_type, entry, sl, tps = parsed
-
-        print(f"\n=== New signal from: {group_name} ===")
-        print(f"{direction} {order_type} {symbol} | Entry: {entry or 'Market'} | SL: {sl} | TPs: {tps}")
-
-        success, result = await place_trade(symbol, direction, order_type, entry, sl, tps)
-
-        if success:
-            print(f"✅ Trade placed: {result}")
-            log_signal(group_name, message_id, symbol, direction, entry, sl, tps, "SUCCESS")
-        else:
-            print(f"❌ Failed: {result}")
-            log_signal(group_name, message_id, symbol, direction, entry, sl, tps, "FAILED", error_message=result)
 
     await client.run_until_disconnected()
 
