@@ -12,6 +12,8 @@ from metaapi_cloud_sdk import MetaApi
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("signal-userbot")
+for noisy in ("engineio", "socketio", "metaapi_cloud_sdk"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 # ================== CONFIG ==================
 API_ID = int(os.environ["API_ID"])
@@ -166,26 +168,29 @@ class Broker:
         self.connection = None
         self._lock = asyncio.Lock()
 
+    async def _open(self):
+        self.api = MetaApi(METAAPI_TOKEN)
+        self.account = await self.api.metatrader_account_api.get_account(ACCOUNT_ID)
+        if self.account.state != "DEPLOYED":
+            await self.account.deploy()
+        await self.account.wait_connected()
+        conn = self.account.get_rpc_connection()
+        await conn.connect()
+        await conn.wait_synchronized()
+        return conn
+
     async def connect(self):
         if self.connection:
             return self.connection
         async with self._lock:
             if self.connection:
                 return self.connection
-            self.api = MetaApi(METAAPI_TOKEN)
-            self.account = await self.api.metatrader_account_api.get_account(ACCOUNT_ID)
-            if self.account.state != "DEPLOYED":
-                await self.account.deploy()
-            await self.account.wait_connected()
-            conn = self.account.get_rpc_connection()
-            await conn.connect()
-            await conn.wait_synchronized()
-            self.connection = conn
-            return conn
+            self.connection = await asyncio.wait_for(self._open(), 180)
+            return self.connection
 
     async def get_account_info(self):
         c = await self.connect()
-        return await c.get_account_information()
+        return await asyncio.wait_for(c.get_account_information(), 30)
 
     async def get_balance(self):
         return float((await self.get_account_info()).get("balance", 0))
@@ -542,7 +547,11 @@ async def main():
 
         # Commands: Saved Messages of this account, or a DM from OWNER_ID
         if event.chat_id == me_id or (OWNER_ID and event.is_private and event.sender_id == OWNER_ID):
-            await handle_command(event, text)
+            try:
+                await handle_command(event, text)
+            except Exception as e:
+                log.exception("Command failed: %s", text)
+                await event.reply(f"❌ {type(e).__name__}: {e}")
             return
 
         # Never trade from DMs or from your own messages
@@ -618,4 +627,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
- 
